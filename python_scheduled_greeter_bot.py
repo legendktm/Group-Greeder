@@ -1,122 +1,298 @@
+import os
 import logging
 from telegram import Update
-from telegram.ext import Application, ContextTypes, CommandHandler
-from telegram.ext import JobQueue
-import time # Included for potential future use, though not strictly required for the current schedule
-
-# --- Configuration ---
-# IMPORTANT: 
-# 1. Replace 'YOUR_BOT_TOKEN' with the actual token you get from BotFather.
-# 2. Make sure you install the library: pip install python-telegram-bot
-BOT_TOKEN = "7716852016:AAF_0q53GVWjNlA76m1g5u2GRyUeMSFTVUk" 
-
-# Enable logging to see activity in the console
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+    JobQueue
 )
-logger = logging.getLogger(__name__)
 
-# Global variable to store the Chat ID of the group where the message should be sent
-TARGET_CHAT_ID = None
+# --- Configuration & Setup ---
 
-# --- Scheduled Job Function ---
+# Set up logging for detailed information
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+# Define state keys for the user conversation flow
+AWAITING_GROUP_INFO, AWAITING_MESSAGE = range(2)
 
-async def periodic_broadcast(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Sends the recurring message to the configured TARGET_CHAT_ID every minute.
-    This function is executed by the JobQueue.
-    """
-    global TARGET_CHAT_ID
+# Global map to track which group belongs to which initiating user
+# Structure: { chat_id (group ID): initiator_user_id }
+# This is crucial for forwarding replies back to the correct person.
+GROUP_TO_INITIATOR = {}
 
-    if TARGET_CHAT_ID:
-        # --- THE MESSAGE CONTENT ---
-        message_text = "Hi I'm boy"
-        # ---------------------------
-        
+# Store the Telegram Bot Token (Replace 'YOUR_BOT_TOKEN_HERE' or use an environment variable)
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7716852016:AAF_0q53GVWjNlA76m1g5u2GRyUeMSFTVUk")
+
+# --- Core Job Function ---
+
+async def send_scheduled_message(context: ContextTypes.DEFAULT_TYPE):
+    """The function executed every minute by the JobQueue."""
+    # Retrieve the target group ID and the message from the job context
+    group_id = context.job.data.get("group_id")
+    message_text = context.job.data.get("message")
+    
+    if group_id and message_text:
         try:
-            # Send the message to the stored chat ID
+            # Send the message to the target group
             await context.bot.send_message(
-                chat_id=TARGET_CHAT_ID, 
+                chat_id=group_id,
                 text=message_text
             )
-            logger.info(f"Scheduled message sent successfully to chat ID: {TARGET_CHAT_ID}")
+            logging.info(f"Scheduled message sent to group: {group_id}")
         except Exception as e:
-            # Catch errors (e.g., bot was removed from the chat)
-            logger.error(f"Failed to send scheduled message to chat {TARGET_CHAT_ID}. Error: {e}")
-    else:
-        logger.warning("Scheduled job ran, but TARGET_CHAT_ID is not set. Use /set_group in a chat.")
+            logging.error(f"Failed to send message to group {group_id}: {e}")
+            # Optionally, notify the initiating user if the bot was removed from the group
+            # or if the group was deactivated.
 
+# --- Command Handlers ---
 
-# --- Handlers (Commands) ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message and instructions."""
-    instructions = (
-        "Hello! I am your minute-by-minute Scheduled Bot.\n\n"
-        "To activate my automatic message broadcast in this group, please use the command:\n"
-        "👉 /set_group"
-    )
-    await update.message.reply_text(instructions)
-
-
-async def set_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sets the current group's ID as the target for the scheduled job."""
-    global TARGET_CHAT_ID
-    
-    # Get the current chat ID and title
-    chat_id = update.effective_chat.id
-    chat_title = update.effective_chat.title if update.effective_chat.title else "this private chat"
-
-    # Restrict /set_group usage to actual group chats
-    if chat_id > 0 and update.effective_chat.type == 'private':
-        await update.message.reply_text("Please use the /set_group command inside the Telegram **group** you want me to message.")
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the /start command, initiates the setup process."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Please use the /start command in a private chat with me to begin the setup.")
         return
 
-    # Store the new target ID globally
-    TARGET_CHAT_ID = chat_id
+    user_id = update.effective_user.id
+    
+    # Check if the user is already setting up a group
+    if context.user_data.get('state') == AWAITING_GROUP_INFO:
+        await update.message.reply_text(
+            "You are already in the process of setting up a group. Please follow the instructions to continue."
+        )
+        return
+
+    # Set the user's state to step 1
+    context.user_data['state'] = AWAITING_GROUP_INFO
+    context.user_data['initiator_id'] = user_id
     
     await update.message.reply_text(
-        f"✅ Success! I will now broadcast the message 'Hi I'm boy' to **{chat_title}** every 60 seconds."
+        f"👋 Hello, {update.effective_user.first_name}!\n\n"
+        "To activate the automated messaging service, please follow these two steps:\n\n"
+        "1. **Add me to your target group** as an administrator.\n"
+        "2. **Forward any message from that group** to this private chat, or send me the group's public `@username`.\n\n"
+        "I need this to securely identify the group. Awaiting your input..."
     )
-    logger.info(f"Target Chat ID set to: {TARGET_CHAT_ID} ({chat_title})")
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stops the scheduled job associated with the initiating user's group."""
+    user_id = update.effective_user.id
+    
+    # Find the group ID this user is associated with as an initiator
+    # We must search the GROUP_TO_INITIATOR map by value (initiator_user_id)
+    target_group_id = next((gid for gid, uid in GROUP_TO_INITIATOR.items() if uid == user_id), None)
+
+    if target_group_id:
+        # Construct the job name based on the group ID (must match how it was created)
+        job_name = f"scheduled_message_{target_group_id}"
+        
+        # Remove the job from the job queue
+        current_jobs = context.application.job_queue.get_jobs_by_name(job_name)
+        for job in current_jobs:
+            job.schedule_removal()
+            
+        # Clear the global tracking maps
+        GROUP_TO_INITIATOR.pop(target_group_id, None)
+        
+        # Clear user state data
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            f"✅ Automation successfully stopped for group ID `{target_group_id}`.\n"
+            "The scheduled messages will no longer be sent."
+        )
+        logging.info(f"Automation stopped by user {user_id} for group {target_group_id}.")
+    else:
+        await update.message.reply_text(
+            "No active automated message job found under your account. Use /start to set one up."
+        )
+
+# --- Message Handlers (For conversation flow and forwarding) ---
+
+async def handle_group_info_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the user's input to identify the target group."""
+    user_id = update.effective_user.id
+    
+    # Ensure this is a private chat and the user is in the correct state
+    if update.effective_chat.type != "private" or context.user_data.get('state') != AWAITING_GROUP_INFO:
+        return # Ignore non-relevant messages
+
+    group_id = None
+    
+    # 1. Check if the message is a Forwarded message from a channel/group
+    if update.message.forward_from_chat:
+        group_id = update.message.forward_from_chat.id
+        group_name = update.message.forward_from_chat.title or "Your Group"
+        
+    # 2. Check if the message is a group/channel username (e.g., @mygroup)
+    elif update.message.text and update.message.text.startswith('@'):
+        # Telegram chat IDs for public usernames are formatted like @username
+        # Note: Bot must be added to a public group by its @username for this to work
+        group_id = update.message.text 
+        group_name = update.message.text
+        
+    if group_id:
+        # Check if this group is already configured by *another* user
+        if group_id in GROUP_TO_INITIATOR and GROUP_TO_INITIATOR[group_id] != user_id:
+             await update.message.reply_text(
+                 f"❌ Error: Group {group_name} is already managed by another user. "
+                 "Only one initiating user can manage a group's scheduling."
+             )
+             context.user_data.pop('state', None) # Clear state
+             return
+
+        # Store the identified group ID
+        context.user_data['group_id'] = group_id
+        context.user_data['state'] = AWAITING_MESSAGE
+        GROUP_TO_INITIATOR[group_id] = user_id # Temporarily map for setup
+        
+        logging.info(f"Group ID {group_id} registered for user {user_id}.")
+
+        await update.message.reply_text(
+            f"✅ Group Identified: **{group_name}**.\n\n"
+            "Now, what message should I send to this group every **1 minute**?\n"
+            'Please specify the exact text in a single message (e.g., "Your Message").'
+        )
+    else:
+        await update.message.reply_text(
+            "I couldn't identify the group. Please ensure you forward a message *from* the group or send the public `@username`."
+        )
+
+
+async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the message input and starts the scheduled job."""
+    user_id = update.effective_user.id
+    
+    # Ensure this is a private chat and the user is in the correct state
+    if update.effective_chat.type != "private" or context.user_data.get('state') != AWAITING_MESSAGE:
+        return # Ignore non-relevant messages
+
+    message_text = update.message.text
+    group_id = context.user_data.get('group_id')
+    
+    if not message_text:
+        await update.message.reply_text("Please send the message text, not a photo or sticker.")
+        return
+
+    if not group_id:
+        # This should not happen if the flow is correct, but handles a safeguard
+        await update.message.reply_text("Configuration error: Target group ID is missing. Please restart with /start.")
+        context.user_data.clear()
+        return
+
+    # --- Start the Scheduling Job ---
+    
+    job_name = f"scheduled_message_{group_id}"
+    
+    # Remove any old jobs for this group just in case (e.g., if user ran /start twice)
+    current_jobs = context.application.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+
+    # Add the new recurring job
+    context.application.job_queue.run_repeating(
+        send_scheduled_message,
+        interval=60,  # 60 seconds (1 minute)
+        first=0,      # Start immediately
+        data={
+            "group_id": group_id,
+            "message": message_text
+        },
+        name=job_name
+    )
+
+    # Clear user state and confirm
+    context.user_data.clear()
+    
+    await update.message.reply_text(
+        f"🎉 **Automation is now LIVE!**\n\n"
+        f"I will send the message:\n\n"
+        f"_{message_text}_\n\n"
+        f"to group `{group_id}` every minute.\n\n"
+        "**Reply Forwarding is Active:** Any replies to my scheduled messages in that group will be forwarded back to this chat.\n\n"
+        "Use /stop at any time to halt the scheduled messages."
+    )
+    logging.info(f"Job started for group {group_id} by user {user_id} with message: {message_text}")
+
+
+async def forward_reply_to_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks if a message is a reply to the bot and forwards it to the initiating user."""
+    
+    # 1. Must be a group chat
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        return
+
+    message = update.effective_message
+    
+    # 2. Must be a reply
+    if not message.reply_to_message:
+        return
+        
+    reply_to = message.reply_to_message
+    
+    # 3. The message being replied to must have been sent by the bot
+    if not reply_to.from_user.is_bot or reply_to.from_user.id != context.bot.id:
+        return
+
+    group_id = update.effective_chat.id
+    
+    # 4. Check if this group is currently tracked in our global map
+    if group_id in GROUP_TO_INITIATOR:
+        initiator_id = GROUP_TO_INITIATOR[group_id]
+        
+        try:
+            # Forward the original reply message to the initiator
+            await context.bot.forward_message(
+                chat_id=initiator_id,
+                from_chat_id=group_id,
+                message_id=message.message_id
+            )
+            # Send a context message to the initiator
+            await context.bot.send_message(
+                chat_id=initiator_id,
+                text=f"**Group Reply Received!**\nThis reply came from group `{update.effective_chat.title}`:",
+            )
+            logging.info(f"Reply forwarded from group {group_id} to initiator {initiator_id}.")
+        except Exception as e:
+            logging.error(f"Failed to forward reply to initiator {initiator_id}: {e}")
 
 
 def main() -> None:
-    """Starts the bot, initializes the JobQueue, and schedules the job."""
+    """Starts the bot."""
+    # Create the Application and pass it your bot's token.
+    application = Application.builder().token(TOKEN).build()
+
+    # --- Handlers ---
     
-    # Safety check for the token
-    if BOT_TOKEN == "YOUR_BOT_TOKEN":
-        print("FATAL ERROR: Please replace 'YOUR_BOT_TOKEN' with your actual Telegram Bot Token before running.")
-        return
-        
-    # 1. Create the Application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("stop", stop_command))
 
-    # 2. Get the JobQueue instance
-    job_queue = application.job_queue
+    # Message handlers for conversational flow in private chat
+    # We use a single text handler and check the state within the handlers
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        handle_group_info_input,
+    ), group=1) # Group 1 for group info input
+    
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        handle_message_input,
+    ), group=2) # Group 2 for message input
 
-    # 3. Schedule the repeating task (Job)
-    # interval=60 means it runs every 60 seconds (1 minute)
-    # first=0 means it runs immediately upon startup, and then every 60 seconds
-    job_queue.run_repeating(
-        periodic_broadcast, 
-        interval=60, 
-        first=0, 
-        name='minute_broadcast'
-    )
-    print("Scheduled job (minute broadcast) successfully added.")
+    # Handler for messages in groups that are replies to the bot
+    application.add_handler(MessageHandler(
+        filters.REPLY & filters.ChatType.GROUPS,
+        forward_reply_to_initiator,
+    ), group=3) # Group 3 for reply forwarding
 
-
-    # 4. Register Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("set_group", set_group))
-
-    # 5. Start the Bot (polling mode)
-    print("Bot is starting and minute-by-minute broadcast is scheduled...")
-    # This function is blocking and will run until you press Ctrl+C
+    # Run the bot until the user presses Ctrl-C
+    # Using long polling is standard for local development or for services like Render
+    print("Bot is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
